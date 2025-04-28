@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8 text-center">
+        <h1 class="display-4 mb-4">Welcome to Stress Chatbot</h1>
+        <p class="lead mb-4">An intelligent chatbot to help you manage stress and find effective coping mechanisms.</p>
+        
+        {% if not current_user.is_authenticated %}
+            <div class="d-grid gap-2 d-sm-flex justify-content-sm-center">
+                <a href="{{ url_for('login') }}" class="btn btn-primary btn-lg px-4 gap-3">Login</a>
+                <a href="{{ url_for('signup') }}" class="btn btn-outline-secondary btn-lg px-4">Sign Up</a>
+            </div>
+        {% else %}
+            <div class="d-grid gap-2 d-sm-flex justify-content-sm-center">
+                <a href="{{ url_for('chatbot') }}" class="btn btn-primary btn-lg px-4 gap-3">Start Chatting</a>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary btn-lg px-4">View History</a>
+            </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row mt-5">
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">Personalized Support</h5>
+                <p class="card-text">Get customized stress management advice based on your unique situation and needs.</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">Track Progress</h5>
+                <p class="card-text">Monitor your stress levels and coping mechanisms over time with our history feature.</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">Access Anywhere</h5>
+                <p class="card-text">Access your stress management history and chatbot from any device with internet access.</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %} 
