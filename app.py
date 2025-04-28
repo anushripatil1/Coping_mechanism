@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -20,7 +20,7 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128))
-    history = db.relationship('ChatHistory', backref='user', lazy=True)
+    conversations = db.relationship('Conversation', backref='user', lazy=True)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -28,12 +28,20 @@ class User(UserMixin, db.Model):
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
-class ChatHistory(db.Model):
+class Conversation(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime)
+    summary = db.Column(db.String(200))
+    messages = db.relationship('ChatMessage', backref='conversation', lazy=True)
+
+class ChatMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    conversation_id = db.Column(db.Integer, db.ForeignKey('conversation.id'), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    command = db.Column(db.String(50))
-    result = db.Column(db.Text)
+    sender = db.Column(db.String(10))  # 'user' or 'bot'
+    content = db.Column(db.Text)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -83,63 +91,98 @@ def signup():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    history = ChatHistory.query.filter_by(user_id=current_user.id).order_by(ChatHistory.timestamp.desc()).all()
-    return render_template('dashboard.html', history=history)
+    conversations = Conversation.query.filter_by(user_id=current_user.id).order_by(Conversation.start_time.desc()).all()
+    return render_template('dashboard.html', conversations=conversations)
+
+@app.route('/conversation/<int:conversation_id>')
+@login_required
+def view_conversation(conversation_id):
+    conversation = Conversation.query.get_or_404(conversation_id)
+    if conversation.user_id != current_user.id:
+        flash('Access denied')
+        return redirect(url_for('dashboard'))
+    return render_template('conversation.html', conversation=conversation)
 
 @app.route('/chatbot', methods=['GET', 'POST'])
 @login_required
 def chatbot():
-    if request.method == 'POST':
-        command = request.form.get('command')
-        field = request.form.get('field')
-        
-        # Get session data from cookies or initialize empty dict
-        session_data = {}
-        if 'session_data' in session:
+    try:
+        if request.method == 'POST':
+            command = request.form.get('command')
+            field = request.form.get('field')
+            
+            # Initialize session data if not exists
+            if 'session_data' not in session:
+                session['session_data'] = {}
+            
             session_data = session['session_data']
-        
-        if field:
-            # Store the answer in session
-            session_data[field] = command
-            session['session_data'] = session_data
+            current_conversation = session.get('current_conversation')
             
-            # Get next question or recommendations
-            response = get_next_question(session_data)
-        else:
-            # Process new command
-            response = process_command(command)
-        
-        if response['type'] == 'question':
-            # Save to history
-            history = ChatHistory(
-                user_id=current_user.id,
-                command=command,
-                result=response['question']
+            # If this is a new conversation (no current conversation)
+            if not current_conversation:
+                conversation = Conversation(user_id=current_user.id)
+                db.session.add(conversation)
+                db.session.commit()
+                session['current_conversation'] = conversation.id
+                current_conversation = conversation.id
+            
+            # Save user message
+            user_message = ChatMessage(
+                conversation_id=current_conversation,
+                sender='user',
+                content=command
             )
-            db.session.add(history)
+            db.session.add(user_message)
+            
+            if field:
+                # Store the answer in session
+                session_data[field] = command
+                session['session_data'] = session_data
+                
+                # Get next question or recommendations
+                response = get_next_question(session_data)
+                
+                # If we got recommendations, end the conversation
+                if response['type'] == 'response':
+                    conversation = Conversation.query.get(current_conversation)
+                    conversation.end_time = datetime.utcnow()
+                    conversation.summary = f"Stress Analysis - {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+                    db.session.commit()
+                    
+                    # Clear session data
+                    session.pop('session_data', None)
+                    session.pop('current_conversation', None)
+            else:
+                # Process new command
+                response = process_command(command)
+                
+                # If starting a new analysis, clear previous session data
+                if command.lower() in ['recommend', 'analyze']:
+                    session['session_data'] = {}
+            
+            # Save bot response
+            bot_message = ChatMessage(
+                conversation_id=current_conversation,
+                sender='bot',
+                content=response['message'] if response['type'] == 'response' else response['question']
+            )
+            db.session.add(bot_message)
             db.session.commit()
             
-            return render_template('chatbot.html', 
-                                result=response['question'],
-                                is_question=True,
-                                field=response['field'])
-        else:
-            # Save to history
-            history = ChatHistory(
-                user_id=current_user.id,
-                command=command,
-                result=response['message']
-            )
-            db.session.add(history)
-            db.session.commit()
-            
-            # Clear session data after providing recommendations
-            if 'session_data' in session:
-                session.pop('session_data')
-            
-            return render_template('chatbot.html', result=response['message'])
-    
-    return render_template('chatbot.html')
+            return jsonify({
+                'message': response['message'] if response['type'] == 'response' else response['question'],
+                'is_question': response['type'] == 'question',
+                'field': response.get('field'),
+                'status': 'success'
+            })
+        
+        return render_template('chatbot.html')
+    except Exception as e:
+        print(f"Error in chatbot route: {str(e)}")  # For debugging
+        return jsonify({
+            'message': 'Sorry, there was an error processing your request.',
+            'status': 'error'
+        }), 500
 
 @app.route('/logout')
 @login_required
@@ -148,28 +191,16 @@ def logout():
     return redirect(url_for('index'))
 
 def process_command(command):
-    if command.lower() == 'recommend':
-        # Start the recommendation process
-        if 'session_data' not in session:
-            # Initialize the recommendation process
-            return {
-                'type': 'question',
-                'question': 'What is your current stress level (1-10)?',
-                'field': 'stress_level'
-            }
-        else:
-            # Continue with the next question based on session data
-            return get_next_question(session['session_data'])
-    elif command.lower() == 'analyze':
+    if command.lower() in ['recommend', 'analyze']:
         return {
             'type': 'question',
-            'question': 'How many hours do you sleep per night?',
-            'field': 'sleep_duration'
+            'question': 'What is your current stress level (1-10)?',
+            'field': 'stress_level'
         }
     elif command.lower() == 'help':
         return {
             'type': 'response',
-            'message': 'Available commands:\n1. recommend - Get personalized coping mechanism recommendations\n2. analyze - Analyze your stress factors\n3. help - Show this help message'
+            'message': 'Available commands:\n1. recommend/analyze - Get personalized stress analysis and recommendations\n2. help - Show this help message'
         }
     else:
         return {
@@ -178,100 +209,150 @@ def process_command(command):
         }
 
 def get_next_question(session_data):
-    # This function will determine the next question based on previous answers
     questions = [
-        {'field': 'sleep_duration', 'question': 'How many hours do you sleep per night?'},
-        {'field': 'study_hours', 'question': 'How many hours do you study per week?'},
-        {'field': 'social_media', 'question': 'How many hours do you spend on social media per day?'},
-        {'field': 'exercise', 'question': 'How many hours do you exercise per week?'},
-        {'field': 'family_support', 'question': 'Rate your family support (1-5):'},
-        {'field': 'financial_stress', 'question': 'Rate your financial stress (1-5):'},
-        {'field': 'peer_pressure', 'question': 'Rate your peer pressure (1-5):'},
-        {'field': 'relationship_stress', 'question': 'Rate your relationship stress (1-5):'}
+        {'field': 'stress_level', 'question': 'What is your current stress level (1-10)?', 'type': 'int', 'min': 1, 'max': 10},
+        {'field': 'sleep_duration', 'question': 'How many hours do you sleep per night?', 'type': 'int', 'min': 0, 'max': 24},
+        {'field': 'study_hours', 'question': 'How many hours do you study per week?', 'type': 'int', 'min': 0, 'max': 100},
+        {'field': 'social_media', 'question': 'How many hours do you spend on social media per day?', 'type': 'int', 'min': 0, 'max': 24},
+        {'field': 'exercise', 'question': 'How many hours do you exercise per week?', 'type': 'int', 'min': 0, 'max': 50},
+        {'field': 'family_support', 'question': 'Rate your family support (1-5):', 'type': 'int', 'min': 1, 'max': 5},
+        {'field': 'financial_stress', 'question': 'Rate your financial stress (1-5):', 'type': 'int', 'min': 1, 'max': 5},
+        {'field': 'peer_pressure', 'question': 'Rate your peer pressure (1-5):', 'type': 'int', 'min': 1, 'max': 5},
+        {'field': 'relationship_stress', 'question': 'Rate your relationship stress (1-5):', 'type': 'int', 'min': 1, 'max': 5}
     ]
-    
-    # Get the next unanswered question
-    for question in questions:
-        if question['field'] not in session_data:
+
+    # Find the first unanswered question
+    for q in questions:
+        field = q['field']
+        if field not in session_data:
+            # If this is not the first question, validate the previous answer
+            if len(session_data) > 0:
+                last_field = list(session_data.keys())[-1]
+                last_value = session_data[last_field]
+                # Find the question spec for the last field
+                last_q = next((item for item in questions if item['field'] == last_field), None)
+                if last_q:
+                    # Validate integer fields
+                    if last_q['type'] == 'int':
+                        try:
+                            val = int(last_value)
+                        except (ValueError, TypeError):
+                            return {
+                                'type': 'question',
+                                'question': f"Please enter a valid number for '{last_q['question']}'",
+                                'field': last_field
+                            }
+                        if not (last_q['min'] <= val <= last_q['max']):
+                            return {
+                                'type': 'question',
+                                'question': f"Please enter a value between {last_q['min']} and {last_q['max']} for '{last_q['question']}'",
+                                'field': last_field
+                            }
+            # Ask the next question
             return {
                 'type': 'question',
-                'question': question['question'],
-                'field': question['field']
+                'question': q['question'],
+                'field': q['field']
             }
-    
-    # If all questions are answered, provide recommendations
+    # All questions answered and validated
     return generate_recommendations(session_data)
 
 def generate_recommendations(answers):
-    stress_level = int(answers.get('stress_level', 5))
-    sleep_duration = int(answers.get('sleep_duration', 7))
-    study_hours = int(answers.get('study_hours', 20))
-    social_media = int(answers.get('social_media', 3))
-    exercise = int(answers.get('exercise', 2))
-    family_support = int(answers.get('family_support', 3))
-    financial_stress = int(answers.get('financial_stress', 3))
-    peer_pressure = int(answers.get('peer_pressure', 3))
-    relationship_stress = int(answers.get('relationship_stress', 3))
-    
-    recommendations = []
-    
-    # Sleep-related recommendations
-    if sleep_duration < 7:
-        recommendations.append("• Try to get at least 7-8 hours of sleep per night")
-        recommendations.append("• Establish a regular sleep schedule")
-    
-    # Study-related recommendations
-    if study_hours > 40:
-        recommendations.append("• Consider breaking your study sessions into smaller chunks")
-        recommendations.append("• Take regular breaks during study sessions")
-    
-    # Social media recommendations
-    if social_media > 4:
-        recommendations.append("• Try to limit social media usage to 2-3 hours per day")
-        recommendations.append("• Take digital detox breaks")
-    
-    # Exercise recommendations
-    if exercise < 3:
-        recommendations.append("• Aim for at least 3 hours of exercise per week")
-        recommendations.append("• Try activities like walking, yoga, or team sports")
-    
-    # Stress level based recommendations
-    if stress_level >= 7:
-        recommendations.append("• Practice mindfulness meditation daily")
-        recommendations.append("• Consider talking to a counselor or therapist")
-        recommendations.append("• Try progressive muscle relaxation techniques")
-    elif stress_level >= 4:
-        recommendations.append("• Practice deep breathing exercises")
-        recommendations.append("• Maintain a regular exercise routine")
-        recommendations.append("• Keep a stress journal")
-    else:
-        recommendations.append("• Continue with your current stress management practices")
-        recommendations.append("• Consider preventive stress management techniques")
-    
-    # Social support recommendations
-    if family_support < 3:
-        recommendations.append("• Try to communicate more with family members")
-        recommendations.append("• Consider joining support groups")
-    
-    # Financial stress recommendations
-    if financial_stress >= 4:
-        recommendations.append("• Create a budget plan")
-        recommendations.append("• Seek financial counseling if needed")
-    
-    # Peer pressure recommendations
-    if peer_pressure >= 4:
-        recommendations.append("• Practice assertiveness skills")
-        recommendations.append("• Surround yourself with supportive friends")
-    
-    # Relationship stress recommendations
-    if relationship_stress >= 4:
-        recommendations.append("• Practice open communication")
-        recommendations.append("• Consider relationship counseling if needed")
-    
-    return {
-        'type': 'response',
-        'message': 'Based on your responses, here are some recommendations:\n' + '\n'.join(recommendations)
-    }
+    try:
+        stress_level = int(answers.get('stress_level', 5))
+        sleep_duration = int(answers.get('sleep_duration', 7))
+        study_hours = int(answers.get('study_hours', 20))
+        social_media = int(answers.get('social_media', 3))
+        exercise = int(answers.get('exercise', 2))
+        family_support = int(answers.get('family_support', 3))
+        financial_stress = int(answers.get('financial_stress', 3))
+        peer_pressure = int(answers.get('peer_pressure', 3))
+        relationship_stress = int(answers.get('relationship_stress', 3))
+        
+        recommendations = []
+        
+        # Stress level based recommendations
+        if stress_level >= 7:
+            recommendations.append("🌟 High stress detected! Let's work on reducing it step by step:")
+            recommendations.append("🎯 Practice mindfulness meditation for 10 minutes daily")
+            recommendations.append("💆‍♂️ Try progressive muscle relaxation before bed")
+            recommendations.append("👥 Consider talking to a counselor or therapist")
+        elif stress_level >= 4:
+            recommendations.append("✨ Moderate stress levels - good time to implement preventive measures:")
+            recommendations.append("🧘‍♀️ Start with 5 minutes of deep breathing exercises daily")
+            recommendations.append("📝 Keep a stress journal to track triggers")
+            recommendations.append("🏃‍♂️ Regular exercise can help manage stress effectively")
+        else:
+            recommendations.append("🌱 Low stress levels - great job! Let's maintain this:")
+            recommendations.append("🌿 Continue with your current stress management practices")
+            recommendations.append("📚 Learn new stress prevention techniques")
+        
+        # Sleep recommendations
+        if sleep_duration < 7:
+            recommendations.append("\n🌙 Sleep Improvement Tips:")
+            recommendations.append("🛌 Aim for 7-8 hours of quality sleep")
+            recommendations.append("⏰ Establish a consistent sleep schedule")
+            recommendations.append("📱 Avoid screens 1 hour before bedtime")
+        
+        # Study recommendations
+        if study_hours > 40:
+            recommendations.append("\n📚 Study Management:")
+            recommendations.append("⏱️ Break study sessions into 25-minute chunks")
+            recommendations.append("🔄 Take 5-minute breaks between sessions")
+            recommendations.append("📅 Create a balanced study schedule")
+        
+        # Social media recommendations
+        if social_media > 4:
+            recommendations.append("\n📱 Digital Wellbeing:")
+            recommendations.append("⏰ Set daily social media time limits")
+            recommendations.append("🌿 Take regular digital detox breaks")
+            recommendations.append("👥 Focus on real-world connections")
+        
+        # Exercise recommendations
+        if exercise < 3:
+            recommendations.append("\n💪 Physical Activity:")
+            recommendations.append("🏃‍♀️ Aim for 30 minutes of exercise daily")
+            recommendations.append("🧘‍♂️ Try yoga or meditation")
+            recommendations.append("🚶‍♂️ Take regular walking breaks")
+        
+        # Social support recommendations
+        if family_support < 3:
+            recommendations.append("\n👨‍👩‍👧‍👦 Family Support:")
+            recommendations.append("💬 Schedule regular family check-ins")
+            recommendations.append("🤝 Join family activities")
+            recommendations.append("👥 Consider family counseling if needed")
+        
+        # Financial stress recommendations
+        if financial_stress >= 4:
+            recommendations.append("\n💰 Financial Wellness:")
+            recommendations.append("📊 Create a monthly budget plan")
+            recommendations.append("💡 Seek financial counseling")
+            recommendations.append("🎯 Set realistic financial goals")
+        
+        # Peer pressure recommendations
+        if peer_pressure >= 4:
+            recommendations.append("\n👥 Peer Relationships:")
+            recommendations.append("💪 Practice assertiveness skills")
+            recommendations.append("🌟 Surround yourself with supportive friends")
+            recommendations.append("🎯 Set clear personal boundaries")
+        
+        # Relationship stress recommendations
+        if relationship_stress >= 4:
+            recommendations.append("\n❤️ Relationship Health:")
+            recommendations.append("🗣️ Practice open communication")
+            recommendations.append("👂 Active listening techniques")
+            recommendations.append("🤝 Consider relationship counseling")
+        
+        return {
+            'type': 'response',
+            'message': '\n'.join(recommendations)
+        }
+    except Exception as e:
+        print(f"Error in generate_recommendations: {str(e)}")  # For debugging
+        return {
+            'type': 'response',
+            'message': 'I encountered an error while generating recommendations. Please try again.'
+        }
 
 if __name__ == '__main__':
     with app.app_context():

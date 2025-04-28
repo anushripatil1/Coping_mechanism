@@ -3,32 +3,24 @@
 {% block content %}
 <div class="row">
     <div class="col-md-12">
-        <h2 class="mb-4">Your Chat History</h2>
+        <h2 class="mb-4">Your Conversations</h2>
         
-        {% if history %}
-            <div class="table-responsive">
-                <table class="table table-striped">
-                    <thead>
-                        <tr>
-                            <th>Date & Time</th>
-                            <th>Command</th>
-                            <th>Result</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for entry in history %}
-                            <tr>
-                                <td>{{ entry.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-                                <td>{{ entry.command }}</td>
-                                <td>{{ entry.result }}</td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+        {% if conversations %}
+            <div class="list-group">
+                {% for conversation in conversations %}
+                    <a href="{{ url_for('view_conversation', conversation_id=conversation.id) }}" 
+                       class="list-group-item list-group-item-action">
+                        <div class="d-flex w-100 justify-content-between">
+                            <h5 class="mb-1">{{ conversation.summary }}</h5>
+                            <small>{{ conversation.start_time.strftime('%Y-%m-%d %H:%M') }}</small>
+                        </div>
+                        <p class="mb-1">Click to view full conversation</p>
+                    </a>
+                {% endfor %}
             </div>
         {% else %}
             <div class="alert alert-info">
-                No chat history found. Start chatting with the bot to see your history here!
+                No conversations found. Start chatting with the bot to see your history here!
             </div>
         {% endif %}
         
